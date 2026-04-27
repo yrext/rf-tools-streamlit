@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Smith Chart</title>
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; font-family: -apple-system, Segoe UI, sans-serif; }
+  svg { display: block; margin: 0 auto; cursor: crosshair; user-select: none; }
+  .grid { fill: none; stroke: #b8b8b8; stroke-width: 1; }
+  .grid-y { fill: none; stroke: #8fb0c8; stroke-width: 1; stroke-dasharray: 3 2; }
+  .vswr { fill: none; stroke: #4a9e6a; stroke-width: 1.5; stroke-dasharray: 6 4; opacity: 0.9; }
+  .vswr-label { font-size: 11px; font-weight: 600; fill: #4a9e6a; }
+  .trace { fill: none; stroke-width: 2; opacity: 0.9; }
+  .trace-ref { fill: none; stroke-width: 1.5; opacity: 0.5; stroke-dasharray: 4 3; }
+  .trace-dot { stroke: white; stroke-width: 2; }
+  .axis { stroke: #999; stroke-width: 1; }
+  .committed { fill: none; stroke-width: 3.5; }
+  .preview { fill: none; stroke-width: 2.5; stroke-dasharray: 7 4; opacity: 0.8; }
+  .node { stroke: white; stroke-width: 2; }
+  .node-label { font-size: 12px; font-weight: 600; fill: #111; }
+  .comp-label { font-size: 12px; font-weight: 600; }
+  .preview-label { font-size: 12px; font-weight: 500; }
+  .hint { font-size: 13px; fill: #666; }
+  .cursor-label {
+    font-size: 12px; font-weight: 600; fill: #111;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    paint-order: stroke; stroke: rgba(255,255,255,0.9); stroke-width: 3; stroke-linejoin: round;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<svg id="chart" width="720" height="720"></svg>
+
+<script>
+// =========================================================================
+// Streamlit component protocol (minimal, no external lib needed)
+// =========================================================================
+function sendMsg(type, data) {
+  window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type }, data || {}), "*");
+}
+const Streamlit = {
+  setValue: (v) => sendMsg("streamlit:setComponentValue", { value: v, dataType: "json" }),
+  setHeight: (h) => sendMsg("streamlit:setFrameHeight", { height: h }),
+  ready: () => sendMsg("streamlit:componentReady", { apiVersion: 1 }),
+};
+
+// =========================================================================
+// Complex + Smith-chart math
+// =========================================================================
+const Z0 = 50;
+
+function zToGamma(re, im) {
+  // (z - Z0) / (z + Z0)
+  const d = (re + Z0) * (re + Z0) + im * im;
+  return [((re - Z0) * (re + Z0) + im * im) / d, (2 * im * Z0) / d];
+}
+function gammaToZ(gx, gy) {
+  // Z0 * (1 + g) / (1 - g)
+  const d = (1 - gx) * (1 - gx) + gy * gy;
+  if (d < 1e-12) return [1e9, 1e9];
+  return [Z0 * (1 - gx * gx - gy * gy) / d, Z0 * 2 * gy / d];
+}
+function invC(re, im) {
+  const d = re * re + im * im;
+  if (d < 1e-12) return [1e9, 1e9];
+  return [re / d, -im / d];
+}
+function seriesArcPts(zStart, zEnd, n = 48) {
+  const pts = [];
+  for (let i = 0; i <= n; i++) {
+    const t = i / n;
+    const x = zStart[1] + t * (zEnd[1] - zStart[1]);
+    pts.push(zToGamma(zStart[0], x));
+  }
+  return pts;
+}
+function shuntArcPts(zStart, zEnd, n = 48) {
+  const [ysr, ysi] = invC(zStart[0], zStart[1]);
+  const [, yei] = invC(zEnd[0], zEnd[1]);
+  const pts = [];
+  for (let i = 0; i <= n; i++) {
+    const t = i / n;
+    const b = ysi + t * (yei - ysi);
+    const [zr, zi] = invC(ysr, b);
+    pts.push(zToGamma(zr, zi));
+  }
+  return pts;
+}
+function compLabel(zStart, zEnd, isSeries, freqHz) {
+  const omega = 2 * Math.PI * freqHz;
+  if (isSeries) {
+    const dX = zEnd[1] - zStart[1];
+    if (dX > 1e-9) return { text: `L=${(dX / omega * 1e9).toFixed(2)} nH`, color: "#5b8def" };
+    if (dX < -1e-9) return { text: `C=${(1 / (omega * Math.abs(dX)) * 1e12).toFixed(2)} pF`, color: "#f97316" };
+    return { text: "—", color: "#888" };
+  } else {
+    const [, ysi] = invC(zStart[0], zStart[1]);
+    const [, yei] = invC(zEnd[0], zEnd[1]);
+    const dB = yei - ysi;
+    if (dB > 1e-9) return { text: `C=${(dB / omega * 1e12).toFixed(2)} pF`, color: "#f97316" };
+    if (dB < -1e-9) return { text: `L=${(1 / (omega * Math.abs(dB)) * 1e9).toFixed(2)} nH`, color: "#5b8def" };
+    return { text: "—", color: "#888" };
+  }
+}
+
+// =========================================================================
+// SVG rendering
+// =========================================================================
+const svg = document.getElementById("chart");
+const W = 720, H = 720, cX = W / 2, cY = H / 2, R = 320;
+const NS = "http://www.w3.org/2000/svg";
+
+function toPx(gx, gy) { return [cX + gx * R, cY - gy * R]; }
+function fromPx(px, py) { return [(px - cX) / R, (cY - py) / R]; }
+function el(tag, attrs, text) {
+  const n = document.createElementNS(NS, tag);
+  if (attrs) for (const k in attrs) n.setAttribute(k, attrs[k]);
+  if (text !== undefined) n.textContent = text;
+  return n;
+}
+function polyline(pts, cls, color) {
+  const d = pts.map(([gx, gy]) => {
+    const [px, py] = toPx(gx, gy);
+    return `${px},${py}`;
+  }).join(" ");
+  const n = el("polyline", { points: d, class: cls });
+  if (color) n.setAttribute("stroke", color);
+  return n;
+}
+
+// =========================================================================
+// State + render
+// =========================================================================
+const state = {
+  nodes: [],              // committed Z values as [re, im]
+  freqHz: 2.4e9,
+  step: 1,
+  clickCount: 0,          // monotonic counter to distinguish new clicks
+  cursor: null,           // [gx, gy] or null when outside/inactive
+  showVswr: false,        // VSWR reference circles toggle
+  trace: [],              // primary Γ trace (array of [gx,gy])
+  traceColor: "#8b5cf6",
+  traceHighlightIdx: -1,  // index of the dot to mark on the primary trace
+  traceRef: [],           // optional secondary Γ trace (drawn faded + dashed)
+  traceRefColor: "#8b5cf6",
+  readonly: false,        // true on the sim-output chart: no clicks, no hints
+};
+
+function render() {
+  // Clear
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+  // Defs: clip path so grid circles don't escape the unit disk
+  const defs = el("defs");
+  const clip = el("clipPath", { id: "smith-clip" });
+  const [pcx, pcy] = toPx(0, 0);
+  clip.appendChild(el("circle", { cx: pcx, cy: pcy, r: R }));
+  defs.appendChild(clip);
+  svg.appendChild(defs);
+
+  const gGrid = el("g", { "clip-path": "url(#smith-clip)" });
+
+  // Constant-R circles
+  for (const r of [0, 0.2, 0.5, 1, 2, 5]) {
+    const [ax, ay] = toPx(r / (r + 1), 0);
+    gGrid.appendChild(el("circle", { cx: ax, cy: ay, r: R / (r + 1), class: "grid" }));
+  }
+  // Constant-X arcs
+  for (const x of [0.2, 0.5, 1, 2, 5, -0.2, -0.5, -1, -2, -5]) {
+    const [ax, ay] = toPx(1, 1 / x);
+    gGrid.appendChild(el("circle", { cx: ax, cy: ay, r: R / Math.abs(x), class: "grid" }));
+  }
+  // Admittance overlay — constant-G circles (mirror of constant-R in the Γ-plane)
+  for (const gg of [0.2, 0.5, 1, 2, 5]) {
+    const [ax, ay] = toPx(-gg / (gg + 1), 0);
+    gGrid.appendChild(el("circle", { cx: ax, cy: ay, r: R / (gg + 1), class: "grid-y" }));
+  }
+  // Admittance overlay — constant-B arcs (mirror of constant-X in the Γ-plane)
+  for (const b of [0.2, 0.5, 1, 2, 5, -0.2, -0.5, -1, -2, -5]) {
+    const [ax, ay] = toPx(-1, -1 / b);
+    gGrid.appendChild(el("circle", { cx: ax, cy: ay, r: R / Math.abs(b), class: "grid-y" }));
+  }
+  // VSWR reference circles (centered at Γ=0)
+  if (state.showVswr) {
+    const [cx0, cy0] = toPx(0, 0);
+    for (const v of [1.5, 2, 3]) {
+      const rho = (v - 1) / (v + 1);  // |Γ| at given VSWR
+      gGrid.appendChild(el("circle", { cx: cx0, cy: cy0, r: rho * R, class: "vswr" }));
+      // Label just above-right of the top of the circle
+      const [lx, ly] = toPx(rho * 0.2, rho);
+      gGrid.appendChild(el("text", { x: lx + 4, y: ly - 4, class: "vswr-label" }, `VSWR ${v}`));
+    }
+  }
+
+  // Real axis
+  const [lx0, ly0] = toPx(-1, 0), [lx1, ly1] = toPx(1, 0);
+  gGrid.appendChild(el("line", { x1: lx0, y1: ly0, x2: lx1, y2: ly1, class: "axis" }));
+  svg.appendChild(gGrid);
+
+  // S-parameter traces (reference first, so primary draws on top)
+  if (state.traceRef && state.traceRef.length > 1) {
+    svg.appendChild(polyline(state.traceRef, "trace-ref", state.traceRefColor));
+  }
+  if (state.trace && state.trace.length > 1) {
+    svg.appendChild(polyline(state.trace, "trace", state.traceColor));
+    if (state.traceHighlightIdx >= 0 && state.traceHighlightIdx < state.trace.length) {
+      const [hgx, hgy] = state.trace[state.traceHighlightIdx];
+      const [hx, hy] = toPx(hgx, hgy);
+      svg.appendChild(el("circle",
+        { cx: hx, cy: hy, r: 6, class: "trace-dot", fill: state.traceColor }));
+    }
+  }
+
+  // Committed arcs (+ component labels)
+  for (let i = 1; i < state.nodes.length; i++) {
+    const prev = state.nodes[i - 1], cur = state.nodes[i];
+    const isSeries = (i % 2 !== 0);
+    const pts = isSeries ? seriesArcPts(prev, cur) : shuntArcPts(prev, cur);
+    const { text, color } = compLabel(prev, cur, isSeries, state.freqHz);
+    svg.appendChild(polyline(pts, "committed", color));
+
+    const mid = pts[Math.floor(pts.length / 2)];
+    const [mx, my] = toPx(mid[0], mid[1]);
+    const dx = isSeries ? 14 : -14;
+    const anchor = isSeries ? "start" : "end";
+    svg.appendChild(el("text",
+      { x: mx + dx, y: my - 8, class: "comp-label", fill: color, "text-anchor": anchor },
+      `${isSeries ? "Series" : "Shunt"} ${text}`));
+  }
+
+  // Committed nodes
+  state.nodes.forEach((z, i) => {
+    const [gx, gy] = zToGamma(z[0], z[1]);
+    const [px, py] = toPx(gx, gy);
+    svg.appendChild(el("circle", { cx: px, cy: py, r: 7, class: "node", fill: i === 0 ? "#111" : "#333" }));
+    const label = i === 0 ? "Load" : `P${i + 1}`;
+    svg.appendChild(el("text", { x: px + 10, y: py - 10, class: "node-label" }, label));
+  });
+
+  // Rubber-band preview (client-side, no server round-trip)
+  if (state.cursor) {
+    if (state.step >= 2 && state.nodes.length > 0) {
+      const prev = state.nodes[state.nodes.length - 1];
+      const rawZ = gammaToZ(state.cursor[0], state.cursor[1]);
+      const isSeries = (state.step === 2);
+      let endZ;
+      if (isSeries) {
+        // Series: constant R — snap end to prev.re + j*raw.im
+        endZ = [prev[0], rawZ[1]];
+      } else {
+        // Shunt: constant G — snap end via admittance
+        const [pyr] = invC(prev[0], prev[1]);
+        const [, ryi] = invC(rawZ[0], rawZ[1]);
+        endZ = invC(pyr, ryi);
+      }
+      const pts = isSeries ? seriesArcPts(prev, endZ) : shuntArcPts(prev, endZ);
+      const { text, color } = compLabel(prev, endZ, isSeries, state.freqHz);
+      svg.appendChild(polyline(pts, "preview", color));
+
+      const endG = zToGamma(endZ[0], endZ[1]);
+      const [epx, epy] = toPx(endG[0], endG[1]);
+      svg.appendChild(el("circle", { cx: epx, cy: epy, r: 6, fill: color, opacity: 0.7 }));
+      svg.appendChild(el("text",
+        { x: epx + 10, y: epy - 10, class: "preview-label", fill: color },
+        `${isSeries ? "Series" : "Shunt"} ${text}`));
+    } else if (state.step === 1) {
+      const [px, py] = toPx(state.cursor[0], state.cursor[1]);
+      svg.appendChild(el("circle", { cx: px, cy: py, r: 6, fill: "#888", opacity: 0.55 }));
+    }
+  }
+
+  // Hint line (top-left) — hidden on read-only charts (e.g. the sim output)
+  if (!state.readonly) {
+    const hints = {
+      1: "Click inside the chart to place the Load",
+      2: "Series match — move and click to place the next node (Const R)",
+      3: "Shunt match — move and click to place the next node (Const G)",
+    };
+    svg.appendChild(el("text", { x: 12, y: 22, class: "hint" }, hints[state.step] || ""));
+  }
+
+  // Floating Z label next to the cursor — only before the Load is placed
+  if (state.cursor && state.nodes.length === 0) {
+    const [px, py] = toPx(state.cursor[0], state.cursor[1]);
+    const [zr, zi] = gammaToZ(state.cursor[0], state.cursor[1]);
+    const sign = zi >= 0 ? "+" : "-";
+    const text = `Z = ${zr.toFixed(1)} ${sign} j${Math.abs(zi).toFixed(1)} Ω`;
+    // Flip side if near right edge / push down if near top to keep it on-screen
+    const rightSide = px > W * 0.65;
+    const tx = px + (rightSide ? -14 : 14);
+    const ty = py < 24 ? py + 20 : py - 12;
+    svg.appendChild(el("text",
+      { x: tx, y: ty, class: "cursor-label", "text-anchor": rightSide ? "end" : "start" },
+      text));
+  }
+}
+
+// =========================================================================
+// Mouse events
+// =========================================================================
+svg.addEventListener("mousemove", (e) => {
+  const rect = svg.getBoundingClientRect();
+  const [gx, gy] = fromPx(e.clientX - rect.left, e.clientY - rect.top);
+  state.cursor = (gx * gx + gy * gy <= 1.02) ? [gx, gy] : null;
+  render();
+});
+svg.addEventListener("mouseleave", () => { state.cursor = null; render(); });
+svg.addEventListener("click", (e) => {
+  if (state.readonly) return;
+  const rect = svg.getBoundingClientRect();
+  const [gx, gy] = fromPx(e.clientX - rect.left, e.clientY - rect.top);
+  if (gx * gx + gy * gy > 1.0) return;
+  state.clickCount += 1;
+  Streamlit.setValue({ type: "click", x: gx, y: gy, click_id: state.clickCount });
+});
+// Right-click → undo latest committed node
+svg.addEventListener("contextmenu", (e) => {
+  e.preventDefault();
+  if (state.readonly) return;
+  if (state.nodes.length === 0) return;
+  state.clickCount += 1;
+  Streamlit.setValue({ type: "undo", click_id: state.clickCount });
+});
+
+// =========================================================================
+// Streamlit render loop
+// =========================================================================
+window.addEventListener("message", (event) => {
+  if (event.data && event.data.type === "streamlit:render") {
+    const args = event.data.args || {};
+    state.nodes = args.nodes || [];
+    state.freqHz = (args.freq_mhz || 2400) * 1e6;
+    state.step = args.step || 1;
+    state.showVswr = !!args.show_vswr;
+    state.trace = args.trace || [];
+    state.traceColor = args.trace_color || "#8b5cf6";
+    state.traceHighlightIdx = (args.trace_highlight_idx !== undefined && args.trace_highlight_idx !== null) ? args.trace_highlight_idx : -1;
+    state.traceRef = args.trace_ref || [];
+    state.traceRefColor = args.trace_ref_color || "#8b5cf6";
+    state.readonly = !!args.readonly;
+    render();
+    Streamlit.setHeight(H);
+  }
+});
+
+// Initial paint
+render();
+Streamlit.setHeight(H);
+Streamlit.ready();
+</script>
+</body>
+</html>
